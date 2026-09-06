@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 import barcode
 from barcode.writer import ImageWriter
-from pyzbar.pyzbar import decode
 from openpyxl.utils import get_column_letter
 from db import get_connection, init_production_db, verify_password
 
@@ -27,7 +26,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-init_production_db()
+# Cache database initialization to avoid repeated table lock overhead
+@st.cache_resource
+def setup_database():
+    init_production_db()
+
+setup_database()
 
 # --- UTILITY ROUTINES ---
 def generate_barcode_label(code_text: str) -> io.BytesIO:
@@ -43,6 +47,7 @@ def decode_barcode_image(image_bytes: bytes) -> str | None:
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
+    from pyzbar.pyzbar import decode
     decoded = decode(img)
     for item in decoded:
         return item.data.decode("utf-8")
@@ -106,8 +111,14 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
 
     hist_query = """
         SELECT h.id, h.timestamp, h.transaction_type, p.name AS item_name, p.barcode,
-               v.name AS vendor_name, h.quantity, h.unit_price, h.cost_price,
-               (h.quantity * h.unit_price) AS total_sale_value,
+               v.name AS vendor_name, h.quantity,
+               COALESCE(h.catalog_price, h.unit_price) AS catalog_mrp,
+               COALESCE(h.discount_amount, 0.0) AS discount_per_unit,
+               (COALESCE(h.discount_amount, 0.0) * h.quantity) AS total_discount_given,
+               h.unit_price AS final_billed_rate,
+               h.cost_price,
+               (h.quantity * COALESCE(h.catalog_price, h.unit_price)) AS gross_mrp_value,
+               (h.quantity * h.unit_price) AS net_collected_value,
                (h.quantity * h.cost_price) AS total_cost_value,
                h.payment_mode,
                COALESCE(NULLIF(h.biller_name, ''), u.full_name, 'Managing Partner') AS biller_name,
@@ -139,23 +150,25 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
     total_stockin_investment = stock_in_df["total_cost_value"].sum() if not stock_in_df.empty else 0.0
 
     gross_units_sold = sales_df["quantity"].sum() if not sales_df.empty else 0
-    gross_sales = sales_df["total_sale_value"].sum() if not sales_df.empty else 0.0
+    gross_mrp_total = sales_df["gross_mrp_value"].sum() if not sales_df.empty else 0.0
+    total_discounts_allowed = sales_df["total_discount_given"].sum() if not sales_df.empty else 0.0
+    net_sales_collected = sales_df["net_collected_value"].sum() if not sales_df.empty else 0.0
     gross_cogs = sales_df["total_cost_value"].sum() if not sales_df.empty else 0.0
 
     returned_units = returns_df["quantity"].sum() if not returns_df.empty else 0
-    return_val = returns_df["total_sale_value"].sum() if not returns_df.empty else 0.0
+    return_refund_val = returns_df["net_collected_value"].sum() if not returns_df.empty else 0.0
     return_cogs = returns_df["total_cost_value"].sum() if not returns_df.empty else 0.0
 
     net_units_sold = gross_units_sold - returned_units
-    net_sales = gross_sales - return_val
+    final_net_revenue = net_sales_collected - return_refund_val
     net_cogs = gross_cogs - return_cogs
     total_exp = expenses_df["amount"].sum() if not expenses_df.empty else 0.0
-    gross_profit = net_sales - net_cogs
+    gross_profit = final_net_revenue - net_cogs
     net_profit = gross_profit - total_exp
 
-    cash_sales = sales_df[sales_df["payment_mode"] == "Cash"]["total_sale_value"].sum() if not sales_df.empty else 0.0
-    gpay_sales = sales_df[sales_df["payment_mode"].str.contains("GPay|UPI|PhonePe", na=False)]["total_sale_value"].sum() if not sales_df.empty else 0.0
-    other_pay_sales = gross_sales - cash_sales - gpay_sales
+    cash_sales = sales_df[sales_df["payment_mode"] == "Cash"]["net_collected_value"].sum() if not sales_df.empty else 0.0
+    gpay_sales = sales_df[sales_df["payment_mode"].str.contains("GPay|UPI|PhonePe", na=False)]["net_collected_value"].sum() if not sales_df.empty else 0.0
+    other_pay_sales = net_sales_collected - cash_sales - gpay_sales
 
     now_ts = datetime.datetime.now()
     tally_data = [
@@ -168,25 +181,27 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
         {"Formal Accounting Parameter": "Approval Authority Role", "Value / Amount": "Executive Partner"},
         {"Formal Accounting Parameter": "----------------------------------------------------", "Value / Amount": "-----------------------"},
         {"Formal Accounting Parameter": "1. INVENTORY MOVEMENT SUMMARY (PIECES)", "Value / Amount": ""},
-        {"Formal Accounting Parameter": "New Garments Purchased & Added to Rack (Stock-In)", "Value / Amount": f"{int(total_units_stocked)} pcs"},
-        {"Formal Accounting Parameter": "Gross Garments Sold to Customers (Stock-Out)", "Value / Amount": f"{int(gross_units_sold)} pcs"},
-        {"Formal Accounting Parameter": "Customer Returns / Reversals Deducted", "Value / Amount": f"{int(returned_units)} pcs"},
+        {"Formal Accounting Parameter": "New Garments Added to Stock (Stock-In)", "Value / Amount": f"{int(total_units_stocked)} pcs"},
+        {"Formal Accounting Parameter": "Gross Garments Billed (Stock-Out)", "Value / Amount": f"{int(gross_units_sold)} pcs"},
+        {"Formal Accounting Parameter": "Customer Returns Deducted", "Value / Amount": f"{int(returned_units)} pcs"},
         {"Formal Accounting Parameter": "Net Garments Sold (Actual Quantity Out)", "Value / Amount": f"{int(net_units_sold)} pcs"},
         {"Formal Accounting Parameter": "----------------------------------------------------", "Value / Amount": "-----------------------"},
-        {"Formal Accounting Parameter": "2. REVENUE & PAYMENT COLLECTIONS (INFLOW)", "Value / Amount": ""},
-        {"Formal Accounting Parameter": "Gross Billing Revenue Generated", "Value / Amount": round(gross_sales, 2)},
+        {"Formal Accounting Parameter": "2. REVENUE, BARGAIN DISCOUNTS & ACTUAL COLLECTIONS", "Value / Amount": ""},
+        {"Formal Accounting Parameter": "Gross Catalog Value (MRP of Sold Garments) (₹)", "Value / Amount": round(gross_mrp_total, 2)},
+        {"Formal Accounting Parameter": "Less: Total Customer Bargaining Discounts Allowed (₹)", "Value / Amount": round(total_discounts_allowed, 2)},
+        {"Formal Accounting Parameter": "Gross Collected Revenue (MRP - Discounts) (₹)", "Value / Amount": round(net_sales_collected, 2)},
         {"Formal Accounting Parameter": "  -> Collected via Cash Register (₹)", "Value / Amount": round(cash_sales, 2)},
         {"Formal Accounting Parameter": "  -> Collected via GPay / PhonePe / UPI (₹)", "Value / Amount": round(gpay_sales, 2)},
         {"Formal Accounting Parameter": "  -> Collected via Card / POS / Bank (₹)", "Value / Amount": round(other_pay_sales, 2)},
-        {"Formal Accounting Parameter": "Less: Customer Refunds Issued for Returns (₹)", "Value / Amount": round(return_val, 2)},
-        {"Formal Accounting Parameter": "NET REVENUE COLLECTED (Actual Inflow) (₹)", "Value / Amount": round(net_sales, 2)},
+        {"Formal Accounting Parameter": "Less: Customer Refunds Paid for Returns (₹)", "Value / Amount": round(return_refund_val, 2)},
+        {"Formal Accounting Parameter": "NET REVENUE REALIZED (Actual Net Inflow) (₹)", "Value / Amount": round(final_net_revenue, 2)},
         {"Formal Accounting Parameter": "----------------------------------------------------", "Value / Amount": "-----------------------"},
-        {"Formal Accounting Parameter": "3. COST OF GOODS SOLD & GROSS MARGIN", "Value / Amount": ""},
-        {"Formal Accounting Parameter": "Wholesale Cost of Net Sold Stock (COGS) (₹)", "Value / Amount": round(net_cogs, 2)},
-        {"Formal Accounting Parameter": "GROSS OPERATING PROFIT MARGIN (Net Revenue - COGS) (₹)", "Value / Amount": round(gross_profit, 2)},
+        {"Formal Accounting Parameter": "3. COST OF GOODS SOLD & REALIZED GROSS MARGIN", "Value / Amount": ""},
+        {"Formal Accounting Parameter": "Net Wholesale Purchase Cost of Sold Stock (COGS) (₹)", "Value / Amount": round(net_cogs, 2)},
+        {"Formal Accounting Parameter": "REALIZED GROSS PROFIT MARGIN (Net Revenue - COGS) (₹)", "Value / Amount": round(gross_profit, 2)},
         {"Formal Accounting Parameter": "----------------------------------------------------", "Value / Amount": "-----------------------"},
         {"Formal Accounting Parameter": "4. OPERATING OVERHEAD EXPENSES (OUTFLOW)", "Value / Amount": ""},
-        {"Formal Accounting Parameter": "Total Boutique Overhead (Rent, EB, Salary, Fuel, etc.) (₹)", "Value / Amount": round(total_exp, 2)},
+        {"Formal Accounting Parameter": "Total Operational Overhead (Rent, EB, Salary, Fuel) (₹)", "Value / Amount": round(total_exp, 2)},
         {"Formal Accounting Parameter": "----------------------------------------------------", "Value / Amount": "-----------------------"},
         {"Formal Accounting Parameter": "5. NET BUSINESS POSITION & PARTNER SETTLEMENT", "Value / Amount": ""},
         {"Formal Accounting Parameter": "FINAL NET PROFIT / (NET LOSS) (₹)", "Value / Amount": round(net_profit, 2)},
@@ -203,11 +218,17 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
 
     tally_df = pd.DataFrame(tally_data)
 
+    discount_history_df = sales_df[sales_df["total_discount_given"] > 0][[
+        "id", "timestamp", "item_name", "barcode", "quantity",
+        "catalog_mrp", "discount_per_unit", "final_billed_rate", "total_discount_given",
+        "customer_name", "customer_phone", "customer_place", "biller_name"
+    ]].copy() if not sales_df.empty else pd.DataFrame()
+
     vendor_analysis = []
     for _, v in vendors_df.iterrows():
         v_sales = sales_df[sales_df["vendor_name"] == v["name"]]
         v_units = v_sales["quantity"].sum() if not v_sales.empty else 0
-        v_rev = v_sales["total_sale_value"].sum() if not v_sales.empty else 0.0
+        v_rev = v_sales["net_collected_value"].sum() if not v_sales.empty else 0.0
         v_cost = v_sales["total_cost_value"].sum() if not v_sales.empty else 0.0
         vendor_analysis.append({
             "Vendor / Supplier Name": v["name"],
@@ -227,6 +248,7 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
         p_in = prod_hist[prod_hist["transaction_type"] == "STOCK_IN"]["quantity"].sum() if not prod_hist.empty else 0
         p_out = prod_hist[prod_hist["transaction_type"] == "STOCK_OUT"]["quantity"].sum() if not prod_hist.empty else 0
         p_ret = prod_hist[prod_hist["transaction_type"] == "RETURN"]["quantity"].sum() if not prod_hist.empty else 0
+        p_disc = prod_hist[prod_hist["transaction_type"] == "STOCK_OUT"]["total_discount_given"].sum() if not prod_hist.empty else 0.0
 
         v_match = vendors_df[vendors_df["id"] == prod["vendor_id"]]
         v_name = v_match["name"].values[0] if not v_match.empty else "Direct"
@@ -236,14 +258,14 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
             "Garment Description": prod["name"],
             "Vendor / Supplier": v_name,
             "Wholesale Purchase Cost (₹)": prod["wholesale_cost"],
-            "Retail Selling Price (₹)": prod["selling_price"],
+            "Retail Catalog MRP (₹)": prod["selling_price"],
             "Current Available Stock (Pcs)": prod["stock_quantity"],
             "Period Stocked In (Pcs)": p_in,
             "Period Sold (Pcs)": p_out,
             "Period Returned (Pcs)": p_ret,
             "Net Sold Volume (Pcs)": (p_out - p_ret),
-            "Period Sales Generated (₹)": (p_out - p_ret) * float(prod["selling_price"]),
-            "Catalog Status": "Active" if prod["is_active"] else "Deactivated",
+            "Total Customer Discounts Given (₹)": p_disc,
+            "Period Net Collected Sales (₹)": (p_out - p_ret) * float(prod["selling_price"]) - p_disc,
             "Reorder Advisory": "🚨 URGENT RESTOCK REQUIRED" if prod["stock_quantity"] <= prod["min_threshold"] and (p_out - p_ret) > 0 else "Stock Adequate"
         })
     item_stock_tally_df = pd.DataFrame(item_summary).sort_values(by="Net Sold Volume (Pcs)", ascending=False)
@@ -259,6 +281,8 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         tally_df.to_excel(writer, sheet_name="Formal_P&L_Tally", index=False)
         history_clean_df.to_excel(writer, sheet_name="Customer_Sales_Ledger", index=False)
+        if not discount_history_df.empty:
+            discount_history_df.to_excel(writer, sheet_name="Customer_Discounts_Ledger", index=False)
         vendor_analysis_df.to_excel(writer, sheet_name="Vendor_Performance_Audit", index=False)
         item_stock_tally_df.to_excel(writer, sheet_name="Product_Sales_Ranking", index=False)
         expenses_clean_df.to_excel(writer, sheet_name="Approved_Expenses", index=False)
@@ -272,7 +296,7 @@ def build_master_excel_workbook(start_date, end_date, timeframe_label, authorize
             for col in ws.columns:
                 max_len = max(len(str(cell.value or '')) for cell in col)
                 col_letter = get_column_letter(col[0].column)
-                ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
+                ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
     conn.close()
     buffer.seek(0)
@@ -284,6 +308,7 @@ if "auth" not in st.session_state:
 
 def logout():
     st.session_state.auth = {"logged_in": False, "user_id": None, "username": "", "role": "", "full_name": ""}
+    st.session_state.cart = []
     st.rerun()
 
 # ----------------------------------------------------
@@ -343,85 +368,214 @@ st.sidebar.button("Logout", on_click=logout)
 partner_names = get_partner_name_list()
 
 # ----------------------------------------------------
-# 1. POINT OF SALE (WITH CUSTOMER, BILLER & REACTIVATION)
+# 1. POINT OF SALE (SAFE INPUT STATE - NO CONFLICTING KEYS)
 # ----------------------------------------------------
 if page == "🛒 Point of Sale (Billing & Customer)":
-    st.subheader("🛒 Fast Billing & Customer Checkout")
+    st.subheader("🛒 Fast Billing & Multi-Item Customer Checkout")
+    st.caption("Live barcode scanning, customer bargaining discount adjustment, and multi-saree billing.")
 
-    with st.expander("📷 Open Camera Scanner", expanded=False):
-        cam = st.camera_input("Scan Barcode")
-        scanned_code = ""
+    if "cart" not in st.session_state:
+        st.session_state.cart = []
+    if "scanned_code_val" not in st.session_state:
+        st.session_state.scanned_code_val = ""
+
+    # Live Camera Scanner
+    with st.expander("📷 Open Live Barcode Scanner", expanded=False):
+        cam = st.camera_input("Scan Saree Tag Barcode")
         if cam:
-            scanned_code = decode_barcode_image(cam.getvalue()) or ""
-            if scanned_code:
-                st.success(f"Scanned: {scanned_code}")
+            detected_code = decode_barcode_image(cam.getvalue())
+            if detected_code:
+                st.session_state.scanned_code_val = detected_code.strip()
+                st.success(f"✅ Barcode Scanned: {detected_code.strip()}")
+                st.rerun()
 
-    with st.form("billing_form"):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            item_barcode = st.text_input("Barcode / Item Code", value=scanned_code)
-        with col2:
-            item_qty = st.number_input("Total Pieces (Qty)", min_value=1, value=1, step=1)
+    # SECTION A: Product Lookup & Custom Pricing
+    st.markdown("##### 🏷️ Step 1: Scan / Enter Item & Price Adjustment")
+    col_b1, col_b2 = st.columns([3, 1])
+    
+    with col_b1:
+        current_barcode = st.text_input(
+            "Barcode / SKU", 
+            value=st.session_state.scanned_code_val,
+            placeholder="Scan or type barcode here..."
+        )
+    with col_b2:
+        item_qty = st.number_input("Pieces", min_value=1, value=1, step=1, key="pos_qty_input")
 
-        st.markdown("##### 💵 Payment & Biller Accountability")
-        pay_c1, pay_c2 = st.columns(2)
-        with pay_c1:
-            payment_mode = st.selectbox("Payment Mode", ["Cash", "GPay / UPI", "PhonePe / Paytm", "Card / POS", "Net Banking"])
-        with pay_c2:
-            biller_name = st.selectbox("Billing Manager / Partner in Charge", partner_names)
+    # Sync manual typing
+    if current_barcode != st.session_state.scanned_code_val:
+        st.session_state.scanned_code_val = current_barcode.strip()
 
-        st.markdown("##### 👤 Customer Details (Optional for CRM & Warranty)")
-        cust_c1, cust_c2, cust_c3 = st.columns(3)
-        with cust_c1:
-            c_name = st.text_input("Customer Name", placeholder="e.g., Priya")
-        with cust_c2:
-            c_phone = st.text_input("Mobile Number", placeholder="e.g., 9876543210")
-        with cust_c3:
-            c_place = st.text_input("Place / City", placeholder="e.g., Salem / Erode")
+    found_item = None
+    target_code = st.session_state.scanned_code_val.strip()
+    if target_code:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, barcode, name, selling_price, wholesale_cost, stock_quantity, is_active 
+            FROM products WHERE barcode = %s;
+        """, (target_code,))
+        found_item = cur.fetchone()
+        cur.close()
+        conn.close()
 
-        submit_bill = st.form_submit_button("Complete Bill & Stock Out", type="primary")
+    if found_item:
+        p_id, b_code, p_name, catalog_price, w_cost, rack_stock, is_act = found_item
+        catalog_price = float(catalog_price)
+        w_cost = float(w_cost)
 
-    if submit_bill:
-        if not item_barcode.strip():
-            st.error("Please enter or scan a barcode.")
+        if not is_act:
+            st.warning(f"⚠️ Item '{p_name}' is currently deactivated. Reactivate it in 'Stock Levels & Catalog' before billing.")
         else:
+            st.info(f"**Garment:** {p_name} | **Rack Stock Available:** {rack_stock} pcs | **Catalog Tag MRP:** ₹{catalog_price:,.2f}")
+            
+            p_col1, p_col2, p_col3, p_col4 = st.columns([2, 2, 2, 2])
+            with p_col1:
+                st.metric("Catalog MRP", f"₹{catalog_price:,.2f}")
+            with p_col2:
+                discount_given = st.number_input(
+                    "Discount per Pc (₹)", 
+                    min_value=0.0, 
+                    max_value=catalog_price, 
+                    value=0.0, 
+                    step=10.0, 
+                    help="Enter customer bargaining discount (e.g. 20, 50)"
+                )
+            with p_col3:
+                final_unit_price = catalog_price - discount_given
+                st.metric("Final Billed Rate", f"₹{final_unit_price:,.2f}")
+                if final_unit_price < w_cost:
+                    st.error(f"⚠️ BELOW WHOLESALE COST! Cost: ₹{w_cost:,.2f}")
+                else:
+                    margin_earned = final_unit_price - w_cost
+                    st.caption(f"Margin Earned: ₹{margin_earned:,.2f}/pc")
+
+            with p_col4:
+                st.write("")
+                st.write("")
+                add_to_cart = st.button("➕ Add to Bill", type="primary")
+
+            if add_to_cart:
+                already_in_cart = sum(item["quantity"] for item in st.session_state.cart if item["product_id"] == p_id)
+                if (already_in_cart + item_qty) > rack_stock:
+                    st.error(f"Cannot add! Available on rack: {rack_stock} pcs (Already in cart: {already_in_cart} pcs).")
+                else:
+                    st.session_state.cart.append({
+                        "product_id": p_id,
+                        "barcode": b_code,
+                        "name": p_name,
+                        "catalog_price": catalog_price,
+                        "discount_per_pc": discount_given,
+                        "selling_price": final_unit_price,
+                        "wholesale_cost": w_cost,
+                        "quantity": item_qty,
+                        "subtotal": item_qty * final_unit_price,
+                        "total_discount": item_qty * discount_given
+                    })
+                    st.session_state.scanned_code_val = ""
+                    st.success(f"Added {item_qty} pcs of '{p_name}' at ₹{final_unit_price:,.2f} each!")
+                    st.rerun()
+    elif target_code:
+        st.error(f"Barcode '{target_code}' not found in catalog.")
+
+    # SECTION B: Display Current Multi-Item Cart
+    if st.session_state.cart:
+        st.markdown("---")
+        st.markdown("##### 🛍️ Current Customer Bill Items")
+        
+        cart_rows = []
+        for idx, item in enumerate(st.session_state.cart):
+            cart_rows.append({
+                "#": idx + 1,
+                "Barcode": item["barcode"],
+                "Garment Style": item["name"],
+                "Catalog MRP": f"₹{item['catalog_price']:,.2f}",
+                "Discount Given": f"₹{item['discount_per_pc']:,.2f}",
+                "Final Rate": f"₹{item['selling_price']:,.2f}",
+                "Quantity": f"{item['quantity']} pcs",
+                "Total Amount": f"₹{item['subtotal']:,.2f}"
+            })
+        st.table(pd.DataFrame(cart_rows))
+
+        total_bill_amount = sum(item["subtotal"] for item in st.session_state.cart)
+        total_bill_pieces = sum(item["quantity"] for item in st.session_state.cart)
+        total_discount_given = sum(item["total_discount"] for item in st.session_state.cart)
+
+        col_tot1, col_tot2, col_tot3, col_clear = st.columns([2, 2, 3, 2])
+        col_tot1.metric("Total Items on Bill", f"{total_bill_pieces} pcs")
+        col_tot2.metric("Total Discount Allowed", f"₹{total_discount_given:,.2f}")
+        col_tot3.metric("GRAND TOTAL COLLECTED", f"₹{total_bill_amount:,.2f}")
+        with col_clear:
+            st.write("")
+            if st.button("🗑️ Clear Entire Bill"):
+                st.session_state.cart = []
+                st.session_state.scanned_code_val = ""
+                st.rerun()
+
+        # SECTION C: Payment & Checkout
+        st.markdown("---")
+        st.markdown("##### 💳 Step 2: Payment & Customer Details")
+        
+        with st.form("checkout_form"):
+            pay_c1, pay_c2 = st.columns(2)
+            with pay_c1:
+                payment_mode = st.selectbox("Payment Mode", ["Cash", "GPay / UPI", "PhonePe / Paytm", "Card / POS", "Net Banking"])
+            with pay_c2:
+                biller_name = st.selectbox("Billing Manager / Partner in Charge", partner_names)
+
+            cust_c1, cust_c2, cust_c3 = st.columns(3)
+            with cust_c1:
+                c_name = st.text_input("Customer Name", placeholder="e.g., Priya")
+            with cust_c2:
+                c_phone = st.text_input("Mobile Number", placeholder="e.g., 9876543210")
+            with cust_c3:
+                c_place = st.text_input("Place / City", placeholder="e.g., Salem / Erode")
+
+            complete_checkout_btn = st.form_submit_button(
+                f"💳 Complete Bill & Receive ₹{total_bill_amount:,.2f} ({total_bill_pieces} pcs)", 
+                type="primary"
+            )
+
+        if complete_checkout_btn:
             conn = get_connection()
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, name, selling_price, wholesale_cost, stock_quantity, is_active 
-                FROM products WHERE barcode = %s;
-            """, (item_barcode.strip(),))
-            prod = cur.fetchone()
 
-            if not prod:
-                st.error("Item barcode not found in catalog.")
-            elif not prod[5]:
-                st.warning(f"⚠️ Item '{prod[1]}' is currently DEACTIVATED, but has {prod[4]} pcs in stock.")
-                st.info("Go to '📦 Stock Levels & Catalog' -> '♻️ Reactivate Deactivated Products' tab to turn it on with partner approval before billing.")
-            elif prod[4] < item_qty:
-                st.error(f"Insufficient stock! Only {prod[4]} pcs available on rack.")
-            else:
-                p_id, p_name, s_price, w_cost, cur_qty, _ = prod
-                new_qty = cur_qty - item_qty
+            try:
+                for item in st.session_state.cart:
+                    # 1. Deduct stock from products catalog
+                    cur.execute("""
+                        UPDATE products 
+                        SET stock_quantity = stock_quantity - %s 
+                        WHERE id = %s;
+                    """, (item["quantity"], item["product_id"]))
 
-                cur.execute("UPDATE products SET stock_quantity = %s WHERE id = %s;", (new_qty, p_id))
-                cur.execute("""
-                    INSERT INTO inventory_history (
-                        product_id, transaction_type, quantity, unit_price, cost_price,
-                        customer_name, customer_phone, customer_place, biller_name, payment_mode, performed_by
-                    ) VALUES (%s, 'STOCK_OUT', %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                """, (
-                    p_id, item_qty, s_price, w_cost,
-                    c_name.strip(), c_phone.strip(), c_place.strip(),
-                    biller_name, payment_mode, st.session_state.auth["user_id"]
-                ))
+                    # 2. Log transaction with catalog MRP, discount amount, and negotiated final rate
+                    cur.execute("""
+                        INSERT INTO inventory_history (
+                            product_id, transaction_type, quantity, unit_price, cost_price,
+                            catalog_price, discount_amount,
+                            customer_name, customer_phone, customer_place, biller_name, payment_mode, performed_by
+                        ) VALUES (%s, 'STOCK_OUT', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    """, (
+                        item["product_id"], item["quantity"], item["selling_price"], item["wholesale_cost"],
+                        item["catalog_price"], item["discount_per_pc"],
+                        c_name.strip(), c_phone.strip(), c_place.strip(),
+                        biller_name, payment_mode, st.session_state.auth["user_id"]
+                    ))
+
                 conn.commit()
-
-                total = float(s_price) * item_qty
-                st.success(f"✅ Billed {item_qty} pcs of '{p_name}' for ₹{total:,.2f} via {payment_mode} by '{biller_name}'. Remaining stock: {new_qty} pcs.")
-
-            cur.close()
-            conn.close()
+                st.session_state.cart = []
+                st.session_state.scanned_code_val = ""
+                st.success(f"🎉 Bill completed! Sold {total_bill_pieces} pcs totaling ₹{total_bill_amount:,.2f} (Total Discount: ₹{total_discount_given:,.2f}) via {payment_mode} to {c_name or 'Walk-in'}.")
+                st.balloons()
+            except Exception as e:
+                conn.rollback()
+                st.error(f"Error completing transaction: {e}")
+            finally:
+                cur.close()
+                conn.close()
+    else:
+        st.info("💡 Scan or type a saree barcode above to inspect the catalog price, set any discount, and add it to the customer's bill.")
 
 # ----------------------------------------------------
 # 2. VENDOR & BEST-SELLER ANALYTICS
@@ -665,9 +819,9 @@ elif page == "📥 Stock-In (New / Restock)":
                 p_id = cur.fetchone()[0]
 
             cur.execute("""
-                INSERT INTO inventory_history (product_id, transaction_type, quantity, unit_price, cost_price, biller_name, payment_mode, performed_by)
-                VALUES (%s, 'STOCK_IN', %s, %s, %s, %s, 'Purchase/StockIn', %s);
-            """, (p_id, units, s_price, w_cost, in_biller, st.session_state.auth["user_id"]))
+                INSERT INTO inventory_history (product_id, transaction_type, quantity, unit_price, cost_price, catalog_price, discount_amount, biller_name, payment_mode, performed_by)
+                VALUES (%s, 'STOCK_IN', %s, %s, %s, %s, 0.0, %s, 'Purchase/StockIn', %s);
+            """, (p_id, units, s_price, w_cost, s_price, in_biller, st.session_state.auth["user_id"]))
             conn.commit()
             cur.close()
             conn.close()
@@ -783,11 +937,15 @@ elif page == "📊 Multi-Month Z-Report & Excel Download":
     tot_stock_in_qty, tot_stock_in_cost = cur.fetchone()
 
     cur.execute("""
-        SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(quantity * unit_price), 0), COALESCE(SUM(quantity * cost_price), 0)
+        SELECT COALESCE(SUM(quantity), 0), 
+               COALESCE(SUM(quantity * COALESCE(catalog_price, unit_price)), 0),
+               COALESCE(SUM(quantity * COALESCE(discount_amount, 0.0)), 0),
+               COALESCE(SUM(quantity * unit_price), 0), 
+               COALESCE(SUM(quantity * cost_price), 0)
         FROM inventory_history
         WHERE transaction_type = 'STOCK_OUT' AND DATE(timestamp) >= %s AND DATE(timestamp) <= %s;
     """, (start_d, end_d))
-    gross_sold_qty, gross_sales_rev, gross_sales_cogs = cur.fetchone()
+    gross_sold_qty, gross_mrp_rev, gross_discount_allowed, gross_sales_collected, gross_sales_cogs = cur.fetchone()
 
     cur.execute("""
         SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(quantity * unit_price), 0), COALESCE(SUM(quantity * cost_price), 0)
@@ -818,28 +976,35 @@ elif page == "📊 Multi-Month Z-Report & Excel Download":
     conn.close()
 
     net_sold_qty = int(gross_sold_qty) - int(ret_qty)
-    net_sales_rev = float(gross_sales_rev) - float(ret_rev)
+    final_net_revenue = float(gross_sales_collected) - float(ret_rev)
     net_cogs = float(gross_sales_cogs) - float(ret_cogs)
-    gross_profit = net_sales_rev - net_cogs
+    gross_profit = final_net_revenue - net_cogs
     net_profit = gross_profit - float(total_expenses)
 
-    st.markdown("#### 📦 1. Inventory Volume Tally")
+    st.markdown("#### 📦 1. Inventory Volume & Movement")
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Stocked In", f"{int(tot_stock_in_qty):,} pcs")
     s2.metric("Gross Sold", f"{int(gross_sold_qty):,} pcs")
-    s3.metric("Returned", f"{int(ret_qty):,} pcs")
+    s3.metric("Customer Returns", f"{int(ret_qty):,} pcs")
     s4.metric("Net Sold Out", f"{net_sold_qty:,} pcs")
 
-    st.markdown("#### 💵 2. Cash Inflow & Payment Methods")
+    st.markdown("#### 🏷️ 2. Gross Tag MRP vs Discounts Allowed")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Catalog Tag Value (MRP)", f"₹{float(gross_mrp_rev):,.2f}")
+    d2.metric("Customer Discounts Allowed", f"- ₹{float(gross_discount_allowed):,.2f}")
+    d3.metric("Gross Collections (MRP - Disc)", f"₹{float(gross_sales_collected):,.2f}")
+    d4.metric("Net Collected (After Returns)", f"₹{final_net_revenue:,.2f}")
+
+    st.markdown("#### 💵 3. Cash Inflow & Payment Methods")
     p1, p2, p3 = st.columns(3)
     p1.metric("💵 Cash Collected", f"₹{pay_splits.get('Cash', 0.0):,.2f}")
     p2.metric("📱 GPay / UPI Collected", f"₹{pay_splits.get('GPay / UPI', 0.0):,.2f}")
     p3.metric("💳 Card / Other Collected", f"₹{sum([v for k, v in pay_splits.items() if k not in ['Cash', 'GPay / UPI']]):,.2f}")
 
-    st.markdown("#### 📈 3. Profit & Loss Reconciliation")
+    st.markdown("#### 📈 4. Profit & Loss Reconciliation")
     f1, f2, f3, f4 = st.columns(4)
-    f1.metric("Net Revenue", f"₹{net_sales_rev:,.2f}")
-    f2.metric("COGS (Cost)", f"₹{net_cogs:,.2f}")
+    f1.metric("Net Revenue", f"₹{final_net_revenue:,.2f}")
+    f2.metric("Net COGS (Cost)", f"₹{net_cogs:,.2f}")
     f3.metric("Overhead Expenses", f"₹{float(total_expenses):,.2f}")
     f4.metric("Net Profit / (Loss)", f"₹{net_profit:,.2f}", delta=f"{net_profit:,.2f}")
 
@@ -907,7 +1072,7 @@ elif page == "🤝 Partner Capital & Equity":
 
     display_df = partners_df.copy()
     display_df["initial_investment"] = display_df["initial_investment"].apply(lambda x: f"₹{float(x):,.2f}")
-    display_df["profit_percentage"] = display_df["profit_percentage"].apply(lambda x: f"{float(x):.2f}%")
+    display_df["profit_percentage"] = display_df["profit_percentage"].apply(lambda x: f"{float(x):,.2f}%")
     st.dataframe(display_df, use_container_width=True)
 
     active_equity_sum = partners_df[partners_df["is_active"] == True]["profit_percentage"].sum()

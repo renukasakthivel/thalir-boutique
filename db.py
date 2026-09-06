@@ -29,6 +29,7 @@ def verify_password(plain_text: str, hashed_text: str) -> bool:
 
 def init_production_db():
     conn = get_connection()
+    conn.autocommit = True
     cur = conn.cursor()
 
     # 1. Users
@@ -69,7 +70,6 @@ def init_production_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("ALTER TABLE vendors ADD COLUMN IF NOT EXISTS address TEXT;")
 
     # 4. Products
     cur.execute("""
@@ -95,6 +95,8 @@ def init_production_db():
         quantity INTEGER NOT NULL CHECK (quantity > 0),
         unit_price NUMERIC(10, 2) NOT NULL,
         cost_price NUMERIC(10, 2) NOT NULL,
+        catalog_price NUMERIC(10, 2),
+        discount_amount NUMERIC(10, 2) DEFAULT 0.00,
         customer_name VARCHAR(100),
         customer_phone VARCHAR(20),
         customer_place VARCHAR(100),
@@ -104,11 +106,6 @@ def init_production_db():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_name VARCHAR(100);")
-    cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20);")
-    cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_place VARCHAR(100);")
-    cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS biller_name VARCHAR(100);")
-    cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS payment_mode VARCHAR(50) DEFAULT 'Cash';")
 
     # 6. Expenses
     cur.execute("""
@@ -123,7 +120,6 @@ def init_production_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS approved_by VARCHAR(100);")
 
     # 7. Audit Logs
     cur.execute("""
@@ -137,6 +133,21 @@ def init_production_db():
     );
     """)
 
+    # Safe Alters
+    try:
+        cur.execute("SET lock_timeout = '2s';")
+        cur.execute("ALTER TABLE vendors ADD COLUMN IF NOT EXISTS address TEXT;")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_name VARCHAR(100);")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20);")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS customer_place VARCHAR(100);")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS biller_name VARCHAR(100);")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS payment_mode VARCHAR(50) DEFAULT 'Cash';")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS catalog_price NUMERIC(10, 2);")
+        cur.execute("ALTER TABLE inventory_history ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(10, 2) DEFAULT 0.00;")
+        cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS approved_by VARCHAR(100);")
+    except Exception:
+        pass
+
     # Seed Admin
     cur.execute("SELECT COUNT(*) FROM users;")
     if cur.fetchone()[0] == 0:
@@ -146,10 +157,9 @@ def init_production_db():
             VALUES ('admin', %s, 'Partner', 'Renuka S');
         """, (admin_pass,))
 
-    conn.commit()
     cur.close()
     conn.close()
 
 if __name__ == "__main__":
     init_production_db()
-    print("Database schema synchronized successfully!")
+    print("Database schema checked and ready!")
